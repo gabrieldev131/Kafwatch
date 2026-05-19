@@ -18,10 +18,25 @@ Ela tenta abrir uma conexão TCP (pois é a utilizada pelas câmeras) com um IP 
 Filtra e adiciona a uma lista apenas as redes locais (LAN) a partir da comparação dos ranges obtidos com o intervalo dos ranges locais registrados na função "eh_rede_local".
 
 ### expande_range_lista_IP
+Adiciona todos os IPs, que estão dentro dos ranges denominados locais, em uma lista.
 
+### criar_pool_threads
+Faz com que cada thread (multiplicada por 8) da máquina ping um IP da lista de IPs das redes locais. Cria outra lista com unicamente os IPs que responderam ao ping.
 
+### ping_em_paralelo
+Chama as funções: filtragem, expande_range_lista_IP e criar_pool_threads. A partir do processo das funções em conjunto, retorna a lista de IPs respondedores. 
 
+### testar_rtsp_describe
+Cria uma conexão TCP com o IP e a porta 554 (usada pelo RTSP), envia ao servidor RTSP o comando DESCRIBE. Se o servidor respondeu "200 OK" e aceitou SDP, é identificado como câmera IP e a função retorna "camera". Se a resposta foi "401 Unauthorized" há a analise do cabeçalho RTSP, se mencionar "Camera" ou "IP Camera", retorna "camera". Caso contrário, retorna "invalid".
 
+### testar_ip_em_todas_as_portas
+Testa um único IP em várias portas RTSP (554, 8554, 10554). Se a porta responde, chama testar_rtsp_describe para verificar se é câmera e apenas retorna os IPs confirmados que são. 
+
+### scan_multiplas_portas
+Para cada IP na lista dos IPs respondedores, chama testar_ip_em_todas_as_portas. Retorna os IPs que são confirmados como câmeras.
+
+### main
+Chama a função obter_redes e atrela a lista retornada à uma variável. Executa ping_em_paralelo para descobrir quais IPs das redes locais responderam ao broadcast ICMP. Chama scan_multiplas_portas para confirmar quais IPs respondedores são, de fato, câmeras.
 
 # Bibliotecas Utilizadas:
 
