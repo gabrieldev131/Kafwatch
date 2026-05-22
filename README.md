@@ -41,11 +41,27 @@ Chama a função obter_redes e atrela a lista retornada à uma variável. Execut
 # Bibliotecas Utilizadas:
 
 ### Netifaces:
-Biblioteca utilizada para 
+A biblioteca é utilizada para adicionar as informações sobre as interfaces de rede disponíveis na máquina em uma lista de dicionários. 
+
+- netifaces.interfaces() lista todas as interfaces de rede
+- netifaces.ifaddresses(iface) retorna os endereços associados a uma interface
+- netifaces.AF_INET constante que representa endereços IPv4.
 
 ### Socket:
+Esta biblioteca é usada para comunicação de rede (TCP/UDP).
+
+- socket.socket() cria um objeto de conexão de rede.
+- socket.create_connection() abre uma conexão TCP com um IP/porta.
+- socket.setdefaulttimeout() define tempo máximo de espera para conexões.
+- s.connect() / s.send() / s.recv() / s.close() comandos para conectar, enviar, receber e fechar conexões.
 
 ### Ipaddress:
+Biblioteca para manipulação de endereços e redes IP.
+
+- ipaddress.IPv4Network("ip/máscara") cria objeto de rede IPv4.
+- .hosts() gera todos os IPs válidos dentro de um range (exclui rede e broadcast).
+- ipaddress.ip_address(ip) cria objeto de endereço IP para verificar se pertence a uma rede.
+- ipaddress.ip_network("rede/máscara") cria objeto de rede para comparação.
 
 ### Scapy.all:
 
