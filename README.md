@@ -30,7 +30,7 @@ Chama as funções: filtragem, expande_range_lista_IP e criar_pool_threads. A pa
 Cria uma conexão TCP com o IP e a porta 554 (usada pelo RTSP), envia ao servidor RTSP o comando DESCRIBE. Se o servidor respondeu "200 OK" e aceitou SDP, é identificado como câmera IP e a função retorna "camera". Se a resposta foi "401 Unauthorized" há a analise do cabeçalho RTSP, se mencionar "Camera" ou "IP Camera", retorna "camera". Caso contrário, retorna "invalid".
 
 ### testar_ip_em_todas_as_portas
-Testa um único IP em várias portas RTSP (554, 8554, 10554). Se a porta responde, chama testar_rtsp_describe para verificar se é câmera e apenas retorna os IPs confirmados que são. 
+Testa um único IP em várias portas RTSP (554, 8554, 10554). Se a porta responde, chama testar_rtsp_describe para verificar se é câmera e apenas retorna os IPs confirmados que são.
 
 ### scan_multiplas_portas
 Para cada IP na lista dos IPs respondedores, chama testar_ip_em_todas_as_portas. Retorna os IPs que são confirmados como câmeras.
@@ -43,9 +43,9 @@ Chama a função obter_redes e atrela a lista retornada à uma variável. Execut
 ### Netifaces:
 A biblioteca é utilizada para adicionar as informações sobre as interfaces de rede disponíveis na máquina em uma lista de dicionários. 
 
-- netifaces.interfaces() lista todas as interfaces de rede
-- netifaces.ifaddresses(iface) retorna os endereços associados a uma interface
-- netifaces.AF_INET constante que representa endereços IPv4.
+- netifaces.interfaces() lista todas as interfaces de rede.
+- netifaces.ifaddresses(iface) retorna os endereços associados a uma interface.
+- netifaces.AF_INET constante que faz retornar apenas os endereços IPv4 (excluindo, por exemplo, endereços IPv6s presentes naquela rede).
 
 ### Socket:
 Esta biblioteca é usada para comunicação de rede (TCP/UDP).
@@ -64,13 +64,32 @@ Biblioteca para manipulação de endereços e redes IP.
 - ipaddress.ip_network("rede/máscara") cria objeto de rede para comparação.
 
 ### Scapy.all:
+Biblioteca que manipula e envia pacotes de rede.
+
+- ARP(pdst=ip) cria pacote ARP para descobrir MAC de um IP.
+- Ether(dst="ff:ff:ff:ff:ff:ff") cria quadro Ethernet broadcast, assim o pacote ARP poderá ser enviado para todas as máquinas da rede local (LAN).
+- srp(ether/arp_req, timeout, iface, verbose=0) envio do pacote ARP ("srp"), definindo qual interface e tempo de aguardo para receber resposta.
+- IP(dst=ip) cria um pacote IP com destino definido pelo parâmetro ip.
+- /TCP(dport=port, flags="S") cria um segmento TCP, onde dport=port define a porta, e flags="S" indica que o pacote é um SYN.
+- .haslayer(TCP) verifica se na resposta tem camada TCP.
+- received[TCP].flags == "SA" confirma se a resposta foi SYN-ACK (porta aberta).
 
 ### Concurrent.futures:
+Usada para paralelismo com threads, permite que vários pings sejam disparados ao mesmo tempo.
+
+- ThreadPoolExecutor(max_workers=n) cria pool de threads.
+- executor.submit(func, args) agenda a função ping_host para rodar em paralelo em uma thread, passando o IP como argumento.
+- as_completed(futures) coleta resultados em um loop conforme cada thread termina.
 
 ### Os:
+Apenas usado para concluir quantas threads a máquina possui.
+
+- os.cpu_count() retorna número de núcleos de CPU.
 
 ### Time
+Usada para medir tempo. 
 
+- time.time() é usado para medir o tempo de um processo.
 
 # KafWatch: Sistema de Streaming de Vídeo Distribuído com Kafka
 
