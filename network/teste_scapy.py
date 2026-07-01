@@ -1,7 +1,9 @@
 import netifaces
 import socket
 import ipaddress
-from scapy.all import IP, TCP, sr, ARP, Ether, srp
+from scapy.layers.inet import IP, TCP
+from scapy.layers.l2 import ARP, Ether
+from scapy.all import sr, srp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
@@ -107,7 +109,7 @@ def criar_pool_threads(todos_os_ips_de_todos_os_ranges):
     """
 
     icmp_hosts = []
-    quantidade_de_threads = os.cpu_count() * 8
+    quantidade_de_threads = (os.cpu_count() or 1) * 8
     with ThreadPoolExecutor(max_workers=quantidade_de_threads) as executor:
 
         # --- Passo 4: Dispara o ping de cada IP como uma tarefa separada ---
@@ -178,7 +180,7 @@ def scan_multiplas_portas(icmp_hosts, redes):
     print("\nVerificando portas RTSP...")
 
     # Cada IP é testado em paralelo em vez de um por um em série
-    quantidade_de_threads = os.cpu_count() * 8
+    quantidade_de_threads = (os.cpu_count() or 1) * 8
     with ThreadPoolExecutor(max_workers=quantidade_de_threads) as executor:
 
         tarefas = {

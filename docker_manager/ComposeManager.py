@@ -20,7 +20,7 @@ class ComposeManager:
             raise FileNotFoundError(f"Arquivo compose não encontrado em: {compose_file_path}")
             
         # O argumento '-f' aponta para o arquivo de configuração
-        self.base_command = ["docker-compose", "-f", compose_file_path]
+        self.base_command = ["docker", "compose", "-f", compose_file_path]
         print(f"ComposeManager inicializado para o arquivo: {compose_file_path}")
 
     def _run_command(self, command_args):
@@ -28,16 +28,17 @@ class ComposeManager:
         Função auxiliar interna para executar um comando de subprocesso
         e imprimir a saída em tempo real.
         """
-        command = self.base_command + command_args
-        print(f"\n Executando comando: {' '.join(command)}")
-        
+        #command = self.base_command + command_args
+        #print(f"\n Executando comando: {' '.join(command)}")
+        aux = self.base_command + command_args
+        command = ' '.join(aux)
         try:
             # Inicia o processo
             # stdout=subprocess.PIPE e stderr=subprocess.PIPE capturam a saída
             # text=True decodifica a saída como texto (UTF-8)
             # bufsize=1 significa "line-buffered"
             with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                  text=True, bufsize=1) as proc:
+                                  text=True, bufsize=1, shell=True) as proc:
                 
                 # Lê e imprime stdout em tempo real
                 print("--- Saída do Contêiner (stdout) ---")
@@ -67,7 +68,7 @@ class ComposeManager:
             print(f"\n Erro inesperado ao executar o comando: {e}")
             return False
 
-    def up(self, build=False, detach=True):
+    def up(self, build=False, detach=False):
         """
         Inicia todos os serviços (equivalente a 'docker compose up').
         
