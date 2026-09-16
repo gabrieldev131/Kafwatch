@@ -68,22 +68,41 @@ class ComposeManager:
             print(f"\n Erro inesperado ao executar o comando: {e}")
             return False
 
-    def up(self, build=False, detach=False):
+    def up(self, build=False, detach=False, force_recreate=False):
         """
         Inicia todos os serviços (equivalente a 'docker compose up').
         
         Args:
             build (bool): Se True, reconstrói as imagens (adiciona '--build').
             detach (bool): Se True, roda em modo "detached" (adiciona '-d').
+            force_recreate (bool): Se True, força a recriação dos containers
+                mesmo sem mudança de config (adiciona '--force-recreate').
+                Útil depois de alterar algo como o tmpfs do kafka: o compose
+                normalmente já detecta e recria sozinho, mas isso garante.
         """
         command = ["up"]
         if build:
             command.append("--build")
         if detach:
             command.append("-d")
+        if force_recreate:
+            command.append("--force-recreate")
             
         print("Subindo contêineres...")
         return self._run_command(command)
+
+    def recreate_service(self, service_name):
+        """
+        Recria um único serviço do zero (para, remove e sobe de novo),
+        útil para o kafka: como os dados agora vivem em tmpfs, recriar
+        o container é a forma mais simples de "zerar" o tópico compactado
+        e garantir que a config nova (compaction/tmpfs) esteja em uso.
+        
+        Args:
+            service_name (str): O nome do serviço (ex: 'kafka').
+        """
+        print(f"Recriando serviço: {service_name}...")
+        return self._run_command(["up", "-d", "--force-recreate", "--no-deps", service_name])
 
     def down(self):
         """

@@ -1,9 +1,7 @@
 import netifaces
 import socket
 import ipaddress
-from scapy.layers.inet import IP, TCP
-from scapy.layers.l2 import ARP, Ether
-from scapy.all import sr, srp
+from scapy.all import IP, TCP, sr, ARP, Ether, srp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
@@ -109,7 +107,7 @@ def criar_pool_threads(todos_os_ips_de_todos_os_ranges):
     """
 
     icmp_hosts = []
-    quantidade_de_threads = (os.cpu_count() or 1) * 8
+    quantidade_de_threads = os.cpu_count() * 8
     with ThreadPoolExecutor(max_workers=quantidade_de_threads) as executor:
 
         # --- Passo 4: Dispara o ping de cada IP como uma tarefa separada ---
@@ -180,7 +178,7 @@ def scan_multiplas_portas(icmp_hosts, redes):
     print("\nVerificando portas RTSP...")
 
     # Cada IP é testado em paralelo em vez de um por um em série
-    quantidade_de_threads = (os.cpu_count() or 1) * 8
+    quantidade_de_threads = os.cpu_count() * 8
     with ThreadPoolExecutor(max_workers=quantidade_de_threads) as executor:
 
         tarefas = {
@@ -218,6 +216,12 @@ def testar_ip_em_todas_as_portas(ip, redes, rtsp_ports):
 
     return cameras_encontradas  # retorna lista de IPs confirmados como câmera neste host
 
+def discover():
+    lista_de_redes = obter_redes()
+    lista_de_respondedores = ping_em_paralelo(lista_de_redes)
+    ip_camera = scan_multiplas_portas(lista_de_respondedores, lista_de_redes)
+
+    return ip_camera  # retorna lista final com todos os IPs confirmados como câmeras IP na rede
 def main():
     start_time = time.time()
     

@@ -19,6 +19,8 @@ services:
     restart: unless-stopped
     ports:
     - 9092:9092
+    tmpfs:
+    - /var/lib/kafka/data
     environment:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_NODE_ID: 1
@@ -32,6 +34,15 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_CLEANUP_POLICY: compact
+      KAFKA_LOG_CLEANER_ENABLE: 'true'
+      KAFKA_LOG_CLEANER_MIN_COMPACTION_LAG_MS: 0
+      KAFKA_LOG_SEGMENT_BYTES: 1048576
+      KAFKA_LOG_SEGMENT_MS: 30000
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 30000
+      KAFKA_MESSAGE_MAX_BYTES: 5242880
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 5242880
   worker-cam1:
     build:
       context: ../worker_build
@@ -61,23 +72,6 @@ services:
     environment:
     - RTSP_URL=rtsp://rtsp-proxy:8554/cam2
     - CAMERA_ID=cam2
-    - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-    volumes:
-    - ./capturas:/app/capturas
-    networks:
-    - camera-net
-  worker-cam3:
-    build:
-      context: ../worker_build
-      dockerfile: Dockerfile
-    container_name: worker-cam3
-    restart: on-failure
-    depends_on:
-    - rtsp-proxy
-    - kafka
-    environment:
-    - RTSP_URL=rtsp://rtsp-proxy:8554/cam3
-    - CAMERA_ID=cam3
     - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
     volumes:
     - ./capturas:/app/capturas

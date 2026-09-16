@@ -35,6 +35,11 @@ class ComposeGenerator:
                     'networks': ['camera-net'],
                     'restart': 'unless-stopped',
                     'ports': ["9092:9092"],
+                    # MODIFICAÇÃO: o diretório de logs do Kafka passa a viver
+                    # inteiramente em RAM (tmpfs). Nada é persistido em disco;
+                    # se o container reiniciar, o histórico é perdido (o que é
+                    # aceitável aqui, já que só nos importa o frame mais recente).
+                    'tmpfs': ['/var/lib/kafka/data'],
                     'environment': {
                         'KAFKA_PROCESS_ROLES': 'broker,controller',
                         'KAFKA_NODE_ID': 1,
@@ -48,6 +53,29 @@ class ComposeGenerator:
                         'KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR': 1,
                         'KAFKA_TRANSACTION_STATE_LOG_MIN_ISR': 1,
                         'CLUSTER_ID': 'MkU3OEVBNTcwNTJENDM2Qk',
+
+                        # --- MODIFICAÇÃO: otimizações para "guardar só o último frame" ---
+                        # Aponta explicitamente o log dir para o tmpfs montado acima.
+                        'KAFKA_LOG_DIRS': '/var/lib/kafka/data',
+                        # 'compact' faz o Kafka manter apenas a última mensagem
+                        # por chave (key) em cada partição, descartando as antigas.
+                        # Ex.: se o worker publicar com key=CAMERA_ID, cada tópico
+                        # de câmera vai reter só o frame mais recente daquela câmera.
+                        'KAFKA_LOG_CLEANUP_POLICY': 'compact',
+                        'KAFKA_LOG_CLEANER_ENABLE': 'true',
+                        # Sem lag mínimo: o compactor pode limpar assim que um
+                        # frame novo com a mesma key chegar.
+                        'KAFKA_LOG_CLEANER_MIN_COMPACTION_LAG_MS': 0,
+                        # Segmentos pequenos e de vida curta = o compactor roda
+                        # com muito mais frequência (por padrão o Kafka só
+                        # compacta segmentos já "fechados").
+                        'KAFKA_LOG_SEGMENT_BYTES': 1048576,       # 1 MB
+                        'KAFKA_LOG_SEGMENT_MS': 30000,            # força "roll" a cada 30s
+                        'KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS': 30000,
+                        # Aumenta o limite de tamanho de mensagem/fetch para
+                        # comportar um frame de imagem (ex.: JPEG) inteiro.
+                        'KAFKA_MESSAGE_MAX_BYTES': 5242880,       # 5 MB
+                        'KAFKA_REPLICA_FETCH_MAX_BYTES': 5242880,
                     }
                 }
             },

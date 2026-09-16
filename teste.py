@@ -1,14 +1,15 @@
-from network.NetworkScanner import NetworkScanner
+#from network.NetworkScanner import NetworkScanner
 from docker_manager.ComposeGenerator import ComposeGenerator
 from docker_manager.ComposeManager import ComposeManager
 from docker_manager.FileSystemWriter import FileSystemWriter
+from network.teste_scapy import discover
 
 if __name__ == "__main__":
     
     # -----------------------------------------------------------------------------------------------
     # 1. Scan na rede para descobrir câmeras
-    found_cameras = NetworkScanner(["10.145.80", "10.145.81", "10.145.82"], range(1, 255), 554, timeout=0.15)
-    cameras = found_cameras.discover()
+    cameras = discover()
+    print(cameras)
     '''
     # -----------------------------------------------------------------------------------------------
     # 2. Gerar arquivos docker-compose para as câmeras descobertas
