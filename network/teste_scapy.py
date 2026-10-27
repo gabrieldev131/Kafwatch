@@ -1,157 +1,181 @@
+import asyncio
 import netifaces
 import socket
 import ipaddress
-from scapy.all import IP, TCP, sr, ARP, Ether, srp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
 
+# Prefixos de interfaces virtuais/containers/VPN que devem ser ignoradas no scan
+IGNORED_INTERFACE_PREFIXES = (
+    "lo", "docker", "br-", "veth", "virbr", "tun", "tap",
+    "wg", "vmnet", "vboxnet", "tailscale", "zt", "cni", "flannel", "cali"
+)
+
+# Intervalos padrão dos ranges das redes locais (RFC 1918) pré-alocados
+REDES_PRIVADAS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+# Limite seguro de conexões simultâneas (abaixo do ulimit -n padrão de 1024)
+MAX_CONCURRENT_PROBES = 512
+DEFAULT_PING_TIMEOUT = 0.15
+DEFAULT_RTSP_TIMEOUT = 0.20
+
+
+def _eh_interface_virtual(iface: str) -> bool:
+    iface_lower = iface.lower()
+    return iface_lower.startswith(IGNORED_INTERFACE_PREFIXES)
+
+
 # --- Função auxiliar para resolver ARP ---
 def resolver_arp(ip, iface):
+    from scapy.all import ARP, Ether, srp
     arp_req = ARP(pdst=ip)
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    ans, _ = srp(ether/arp_req, timeout=0.5, iface=iface, verbose=0)
+    ans, _ = srp(ether / arp_req, timeout=0.5, iface=iface, verbose=0)
     if ans:
         return ans[0][1].hwsrc  # MAC do destino
     return None
 
+
 # Descobre interfaces de rede
 def obter_redes():
     """
-    # Função da qual se obtem os endereços de ip da máquina host (redes das quais a máquina está conectada)
+    Obtém os endereços de IP da máquina host (redes físicas/LAN às quais a máquina está conectada),
+    ignorando interfaces de loopback, Docker bridges e VPNs.
 
-    Retorna uma lista com todas as conexões
+    Retorna uma lista com todas as conexões válidas.
     """
     redes = []
     for iface in netifaces.interfaces():
+        if _eh_interface_virtual(iface):
+            continue
+
         addrs = netifaces.ifaddresses(iface)
         if netifaces.AF_INET in addrs:
-
             for ip_info in addrs[netifaces.AF_INET]:
-                ip = ip_info['addr']
-                netmask = ip_info['netmask']
-                network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+                ip = ip_info.get("addr")
+                netmask = ip_info.get("netmask")
+                if not ip or not netmask:
+                    continue
 
-                tabela = {"interface": iface, "ip": ip, "mascara": netmask, "range": str(network)}
+                network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+                tabela = {
+                    "interface": iface,
+                    "ip": ip,
+                    "mascara": netmask,
+                    "range": str(network),
+                }
                 if tabela not in redes:
                     redes.append(tabela)
     return redes
 
-# - descobrir qual dos renges são de uma rede local (LAN) -
 
-def eh_rede_local(ip: str) -> bool: # "-> bool" significa que o retorno vai ser booleano, e "ip: str" significa que só entram IPs salvos em formato string
-
-    # intervalos padrão dos ranges das redes locais 
-    REDES_PRIVADAS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ]
-
-    endereco = ipaddress.ip_address(ip) 
-    for rede in REDES_PRIVADAS:
-        if endereco in rede:
-            return True
-    return False
+# - Descobrir quais dos ranges são de uma rede local (LAN) -
+def eh_rede_local(ip: str) -> bool:
+    endereco = ipaddress.ip_address(ip)
+    return any(endereco in rede for rede in REDES_PRIVADAS)
 
 
-# Função de ping otimizada
-def ping_host(ip, porta=80, timeout=0.25):
+# Função de ping TCP otimizada (sem mutar timeout global de socket)
+def ping_host(ip, porta=554, timeout=DEFAULT_PING_TIMEOUT):
+    ip_str = str(ip)
     try:
-        socket.setdefaulttimeout(timeout)
-        with socket.create_connection((str(ip), porta), timeout=timeout):
-            return ip  # IP respondeu
-    except (socket.timeout, socket.error):
+        with socket.create_connection((ip_str, porta), timeout=timeout):
+            return ip_str  # Porta aberta: host ativo
+    except ConnectionRefusedError:
+        # TCP RST recebido imediatamente: o host existe e está ativo na rede!
+        return ip_str
+    except (socket.timeout, OSError):
         return None  # IP não respondeu
-    
-#ping em paralelo
+
+
 def filtragem(redes):
     """
-    # Passo 1: Filtra apenas as redes locais (LAN)
-
-    nem toda interface da máquina é uma rede local (pode ter VPN, loopback, etc.)
-    então percorre todas as redes e guarda só os ranges das que forem locais
+     Passo 1: Filtra apenas as redes locais (LAN) válidas,
+    ignorando interfaces virtuais (Docker, loopback, VPN) e duplicatas.
     """
-
     ranges_locais = []
     for rede in redes:
+        iface = rede.get("interface", "")
+        if _eh_interface_virtual(iface):
+            continue
         ip_da_rede = rede["ip"]
-        este_ip_é_local = eh_rede_local(ip_da_rede)
-        if este_ip_é_local:
+        if eh_rede_local(ip_da_rede):
             range_da_rede = rede["range"]
-            ranges_locais.append(range_da_rede)  # ex: "192.168.1.0/24"
+            if range_da_rede not in ranges_locais:
+                ranges_locais.append(range_da_rede)  # ex: "192.168.1.0/24"
     return ranges_locais
 
-def expande_range_lista_IP (ranges_locais):
-    """
-    # Expande cada range em uma lista de IPs individuais
 
-    um range como "192.168.1.0/24" representa 254 IPs (192.168.1.1 até 192.168.1.254)
-    .hosts() faz essa expansão automaticamente, ignorando o IP de rede e o de broadcast
-    todos os IPs de todos os ranges são juntados em uma lista única para que
-    um único pool de threads cubra tudo, sem precisar recriar o pool a cada range
+def expande_range_lista_IP(ranges_locais):
+    """
+    Expande cada range em uma lista de IPs individuais (em formato string).
     """
     todos_os_ips_de_todos_os_ranges = []
     for range_da_rede in ranges_locais:
         target_network = ipaddress.IPv4Network(range_da_rede, strict=False)
-        todos_os_ips_de_todos_os_ranges.extend(target_network.hosts())
+        todos_os_ips_de_todos_os_ranges.extend(str(ip) for ip in target_network.hosts())
     return todos_os_ips_de_todos_os_ranges
+
+
+async def _async_probe_host(ip_str: str, sem: asyncio.Semaphore, porta: int = 554, timeout: float = DEFAULT_PING_TIMEOUT):
+    async with sem:
+        try:
+            conn = asyncio.open_connection(ip_str, porta)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return ip_str
+        except ConnectionRefusedError:
+            # Host respondeu com TCP RST, portanto está ativo na LAN
+            return ip_str
+        except Exception:
+            return None
+
+
+async def _async_ping_hosts(ips_list, porta=554, timeout=DEFAULT_PING_TIMEOUT):
+    sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+    tasks = [_async_probe_host(str(ip), sem, porta=porta, timeout=timeout) for ip in ips_list]
+    results = await asyncio.gather(*tasks)
+    return [ip for ip in results if ip is not None]
+
 
 def criar_pool_threads(todos_os_ips_de_todos_os_ranges):
     """
-    # Cria o pool de threads 
-
-    cada thread vai rodar ping_host(ip) de forma independente
-    multiplicar por 8 compensa o tempo ocioso de espera da resposta do ping:
-    enquanto uma thread aguarda, outras 7 já estão pingando outros IPs
+    Executa a descoberta de hosts ativos em alta concorrência usando I/O assíncrono
+    (capaz de sondar centenas de IPs simultaneamente com baixo custo de CPU).
     """
-
-    icmp_hosts = []
-    quantidade_de_threads = os.cpu_count() * 8
-    with ThreadPoolExecutor(max_workers=quantidade_de_threads) as executor:
-
-        # --- Passo 4: Dispara o ping de cada IP como uma tarefa separada ---
-        # executor.submit() agenda ping_host(ip) para rodar em uma thread livre
-        # o dicionário futures guarda qual tarefa corresponde a qual IP
-        futures = {}
-        for ip in todos_os_ips_de_todos_os_ranges:
-            tarefa = executor.submit(ping_host, str(ip))
-            futures[tarefa] = ip
-
-        # --- Passo 5: Coleta os resultados conforme as tarefas terminam ---
-        # as_completed() não espera todas terminarem: já processa cada uma que ficar pronta
-        # ping_host retorna o IP se respondeu, ou None se não respondeu
-        for tarefa in as_completed(futures):
-            ip_que_respondeu = tarefa.result()
-            if ip_que_respondeu:
-                icmp_hosts.append(ip_que_respondeu)
-
-    return icmp_hosts  # retorna lista de IPs que responderam ao ping
+    if not todos_os_ips_de_todos_os_ranges:
+        return []
+    return asyncio.run(_async_ping_hosts(todos_os_ips_de_todos_os_ranges))
 
 
 def ping_em_paralelo(redes):
-
     ranges_locais = filtragem(redes)
-    ips_nos_ranges = expande_range_lista_IP (ranges_locais)
+    ips_nos_ranges = expande_range_lista_IP(ranges_locais)
     icmp_hosts = criar_pool_threads(ips_nos_ranges)
+    return icmp_hosts
 
-    return icmp_hosts  # retorna lista de IPs que responderam ao ping
 
-    
-def testar_rtsp_describe(ip, port=554):
+def testar_rtsp_describe(ip, port=554, timeout=DEFAULT_RTSP_TIMEOUT):
+    ip_str = str(ip)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.1)
-        s.connect((ip, port))
-
-        rtsp_request = (
-            f"DESCRIBE rtsp://{ip}:{port}/ RTSP/1.0\r\n"
-            f"CSeq: 1\r\n"
-            f"Accept: application/sdp\r\n\r\n"
-        )
-        s.send(rtsp_request.encode())
-        resposta = s.recv(4096).decode(errors="ignore")
-        s.close()
+        with socket.create_connection((ip_str, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            rtsp_request = (
+                f"DESCRIBE rtsp://{ip_str}:{port}/ RTSP/1.0\r\n"
+                f"CSeq: 1\r\n"
+                f"Accept: application/sdp\r\n\r\n"
+            )
+            s.sendall(rtsp_request.encode())
+            resposta = s.recv(4096).decode(errors="ignore")
 
         if "RTSP/1.0 200 OK" in resposta and "application/sdp" in resposta:
             return "camera"
@@ -170,81 +194,108 @@ def testar_rtsp_describe(ip, port=554):
         return "error"
 
 
-# --- Passo 2: TCP SYN scan em múltiplas portas RTSP ---
-def scan_multiplas_portas(icmp_hosts, redes):
+async def _async_testar_rtsp_describe(ip_str: str, port: int, sem: asyncio.Semaphore, timeout: float = DEFAULT_RTSP_TIMEOUT) -> str:
+    async with sem:
+        try:
+            conn = asyncio.open_connection(ip_str, port)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+            try:
+                rtsp_request = (
+                    f"DESCRIBE rtsp://{ip_str}:{port}/ RTSP/1.0\r\n"
+                    f"CSeq: 1\r\n"
+                    f"Accept: application/sdp\r\n\r\n"
+                )
+                writer.write(rtsp_request.encode())
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+                data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+                resposta = data.decode(errors="ignore")
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+            if "RTSP/1.0 200 OK" in resposta and "application/sdp" in resposta:
+                return "camera"
+            elif "RTSP/1.0 401 Unauthorized" in resposta:
+                if "DVR" in resposta or "NVR" in resposta:
+                    return "dvr"
+                elif "Camera" in resposta or "IP Camera" in resposta:
+                    return "camera"
+                else:
+                    return "unknown"
+            return "invalid"
+        except Exception:
+            return "error"
+
+
+async def _async_testar_ip_portas(ip_str: str, rtsp_ports, sem: asyncio.Semaphore):
+    for port in rtsp_ports:
+        resultado = await _async_testar_rtsp_describe(ip_str, port, sem)
+        if resultado == "camera":
+            return ip_str
+    return None
+
+
+async def _async_scan_multiplas_portas(icmp_hosts, rtsp_ports):
+    sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+    tasks = [_async_testar_ip_portas(str(ip), rtsp_ports, sem) for ip in icmp_hosts]
+    results = await asyncio.gather(*tasks)
+    # Preserva a ordem e remove duplicatas
+    return list(dict.fromkeys(ip for ip in results if ip is not None))
+
+
+# --- Passo 2: Scan rápido em múltiplas portas RTSP ---
+def scan_multiplas_portas(icmp_hosts, redes=None):
     rtsp_ports = [554, 8554, 10554]
-    camera_result = []
+    if not icmp_hosts:
+        return []
 
     print("\nVerificando portas RTSP...")
+    return asyncio.run(_async_scan_multiplas_portas(icmp_hosts, rtsp_ports))
 
-    # Cada IP é testado em paralelo em vez de um por um em série
-    quantidade_de_threads = os.cpu_count() * 8
-    with ThreadPoolExecutor(max_workers=quantidade_de_threads) as executor:
 
-        tarefas = {
-            executor.submit(testar_ip_em_todas_as_portas, ip, redes, rtsp_ports): ip
-            for ip in icmp_hosts
-        }
+def testar_ip_em_todas_as_portas(ip, redes=None, rtsp_ports=None):
+    """Testa todas as portas RTSP de um único IP diretamente via socket TCP."""
+    if rtsp_ports is None:
+        rtsp_ports = [554, 8554, 10554]
 
-        for tarefa in as_completed(tarefas):
-            cameras_do_ip = tarefa.result()
-            camera_result.extend(cameras_do_ip)
-
-    return camera_result  # retorna lista final com todos os IPs confirmados como câmeras IP na rede
-
-def testar_ip_em_todas_as_portas(ip, redes, rtsp_ports):
-    #Testa todas as portas RTSP de um único IP — roda em paralelo por IP.
-
-    # Descobre a interface de rede deste IP
-    iface = None
-    for rede in redes:
-        if ipaddress.ip_address(ip) in ipaddress.ip_network(rede["range"], strict=False):
-            iface = rede["interface"]
-            break
-
+    ip_str = str(ip)
     cameras_encontradas = []
     for port in rtsp_ports:
-        pkt = IP(dst=ip)/TCP(dport=port, flags="S")
-        ans, _ = sr(pkt, timeout=0.25, retry=0, verbose=0, iface=iface)
+        resultado_rtsp = testar_rtsp_describe(ip_str, port)
+        if resultado_rtsp == "camera":
+            cameras_encontradas.append(ip_str)
+            break
 
-        for sent, received in ans:
-            tcp_respondeu_com_syn_ack = received.haslayer(TCP) and received[TCP].flags == "SA"
-            if tcp_respondeu_com_syn_ack:
-                resultado_rtsp = testar_rtsp_describe(received[IP].src, port)
-                if resultado_rtsp == "camera":
-                    cameras_encontradas.append(ip)
+    return cameras_encontradas
 
-    return cameras_encontradas  # retorna lista de IPs confirmados como câmera neste host
 
 def discover():
     lista_de_redes = obter_redes()
     lista_de_respondedores = ping_em_paralelo(lista_de_redes)
     ip_camera = scan_multiplas_portas(lista_de_respondedores, lista_de_redes)
+    return ip_camera
 
-    return ip_camera  # retorna lista final com todos os IPs confirmados como câmeras IP na rede
+
 def main():
     start_time = time.time()
-    
-    lista_de_redes = obter_redes() #redes em que a máquina está conectada
-    lista_de_respondedores = ping_em_paralelo(lista_de_redes) #responderam ao broadcast
-    entertime = time.time()
-    
-    """
-    lista_de_redes é o parâmetro de entrada, ou seja, a função ping_em_paralelo
-    utiliza o que há dentro dela como se fosse o parametro local "redes", quando "redes" é
-    utilizada dentro de ping_em_paralelo o valor que será utilizado agora será o de
-    "lista_de_redes"
 
-    """
-    ip_camera = scan_multiplas_portas(lista_de_respondedores, lista_de_redes) #são cameras da rede local identificada
+    lista_de_redes = obter_redes()  # redes em que a máquina está conectada
+    lista_de_respondedores = ping_em_paralelo(lista_de_redes)  # responderam na rede local
+    entertime = time.time()
+
+    ip_camera = scan_multiplas_portas(lista_de_respondedores, lista_de_redes)  # câmeras confirmadas
 
     final_time = time.time()
-    
-    print(f'{entertime - start_time}')
-    
-    print(f'{final_time - start_time}')
-    print(f'{ip_camera}')
+
+    print(f"{entertime - start_time:.3f}s")
+    print(f"{final_time - start_time:.3f}s")
+    print(f"{ip_camera}")
 
     return 0
+
+
 if __name__ == "__main__":
     main()

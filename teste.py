@@ -9,7 +9,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------------------------
     # 1. Scan na rede para descobrir câmeras
     cameras = discover()
-    print(cameras)
+    
     '''
     # -----------------------------------------------------------------------------------------------
     # 2. Gerar arquivos docker-compose para as câmeras descobertas

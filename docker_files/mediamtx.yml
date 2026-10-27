@@ -1,5 +1,1 @@
-paths:
-  cam1:
-    source: rtsp://admin:Aluno%4000@10.145.80.51:554
-  cam2:
-    source: rtsp://admin:Aluno%4000@10.145.80.52:554
+paths: {}

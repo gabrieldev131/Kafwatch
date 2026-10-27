@@ -26,43 +26,36 @@ class ComposeManager:
     def _run_command(self, command_args):
         """
         Função auxiliar interna para executar um comando de subprocesso
-        e imprimir a saída em tempo real.
+        e imprimir a saída em tempo real sem risco de deadlock nos buffers de pipe.
         """
-        #command = self.base_command + command_args
-        #print(f"\n Executando comando: {' '.join(command)}")
-        aux = self.base_command + command_args
-        command = ' '.join(aux)
+        command = self.base_command + command_args
         try:
-            # Inicia o processo
-            # stdout=subprocess.PIPE e stderr=subprocess.PIPE capturam a saída
-            # text=True decodifica a saída como texto (UTF-8)
-            # bufsize=1 significa "line-buffered"
-            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                  text=True, bufsize=1, shell=True) as proc:
-                
-                # Lê e imprime stdout em tempo real
-                print("--- Saída do Contêiner (stdout) ---")
+            # Redireciona stderr para stdout (stderr=subprocess.STDOUT) e usa shell=False
+            # para evitar deadlock quando o Docker Compose escreve mais de 64KB no stderr
+            with subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                shell=False
+            ) as proc:
+                print("--- Saída do Docker Compose ---")
                 if proc.stdout:
                     for line in proc.stdout:
                         print(line, end='', flush=True)
-                
-                # Lê e imprime stderr após o stdout
-                print("\n--- Saída de Erro (stderr) ---")
-                if proc.stderr:
-                    for line in proc.stderr:
-                        print(line, end='', flush=True)
-                
-                proc.wait() # Espera o processo terminar
-                
+
+                proc.wait()
+
                 if proc.returncode != 0:
                     print(f"\n Erro: Comando falhou com código de saída {proc.returncode}")
                     return False
-                
+
             print("\n Comando executado com sucesso.")
             return True
 
         except FileNotFoundError:
-            print("\n Erro: 'docker' não encontrado. Você instalou o Docker Desktop?")
+            print("\n Erro: 'docker' não encontrado. Verifique se o Docker está instalado e em execução.")
             return False
         except Exception as e:
             print(f"\n Erro inesperado ao executar o comando: {e}")
@@ -77,10 +70,8 @@ class ComposeManager:
             detach (bool): Se True, roda em modo "detached" (adiciona '-d').
             force_recreate (bool): Se True, força a recriação dos containers
                 mesmo sem mudança de config (adiciona '--force-recreate').
-                Útil depois de alterar algo como o tmpfs do kafka: o compose
-                normalmente já detecta e recria sozinho, mas isso garante.
         """
-        command = ["up"]
+        command = ["up", "--remove-orphans"]
         if build:
             command.append("--build")
         if detach:
