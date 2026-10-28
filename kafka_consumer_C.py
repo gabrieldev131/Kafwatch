@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import threading
 import time
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, TopicPartition, OFFSET_END
 from dotenv import load_dotenv
 
 # --- Classe Worker de Alta Performance (C-Based) ---
@@ -12,12 +12,17 @@ class TurboKafkaReader:
         self.lock = threading.Lock()
         self.running = False
         self.latest_frames = {} 
+        self.bootstrap_servers = bootstrap_servers
+        self.topic_name = topic_name
         self.target_camera_id = target_camera_id # Opcional: Filtra apenas uma câmera
+        self._assigned = False
+        self._last_assign_attempt = 0.0
+        self._warned_no_topic = False
         
         # Configurações do librdkafka (C Driver) para Latência Zero
         conf = {
             'bootstrap.servers': bootstrap_servers,
-            'group.id': group_id,
+            'group.id': f"{group_id}-{os.getpid()}-{int(time.time() * 1000)}",
             'auto.offset.reset': 'latest',
             
             # OTIMIZAÇÕES DE REDE
@@ -25,19 +30,70 @@ class TurboKafkaReader:
             'socket.receive.buffer.bytes': 10 * 1024 * 1024, 
             # Tamanho máximo de fetch
             'fetch.message.max.bytes': 5 * 1024 * 1024,
+            'max.partition.fetch.bytes': 5 * 1024 * 1024,
             
             # OTIMIZAÇÕES DE LATÊNCIA
             # Não espere o buffer encher, envie o que tiver
             'fetch.wait.max.ms': 5, 
             # Desliga o commit automático (ganha performance, não precisamos persistir offset de vídeo)
-            'enable.auto.commit': False, 
+            'enable.auto.commit': False,
+            'allow.auto.create.topics': True,
+            'topic.metadata.refresh.interval.ms': 2000,
         }
 
         self.consumer = Consumer(conf)
-        self.consumer.subscribe([topic_name])
+        self._ensure_assigned()
         
         self.thread = threading.Thread(target=self._update_loop)
         self.thread.daemon = True 
+
+    def _ensure_assigned(self) -> bool:
+        """
+        Atribui diretamente as partições do tópico usando os offsets finais (watermark)
+        para eliminar o atraso de rebalanceamento de grupo (3s-45s) e ler imediatamente
+        o frame compactado mais recente de cada câmera.
+        """
+        if self._assigned:
+            return True
+
+        now = time.perf_counter()
+        if (now - self._last_assign_attempt) < 1.0:
+            return False
+        self._last_assign_attempt = now
+
+        try:
+            md = self.consumer.list_topics(self.topic_name, timeout=1.5)
+            topic_meta = md.topics.get(self.topic_name)
+            if topic_meta is None or topic_meta.error is not None or not topic_meta.partitions:
+                if not self._warned_no_topic:
+                    print(
+                        f"[Kafka] Tópico '{self.topic_name}' ainda sem partições em "
+                        f"'{self.bootstrap_servers}'. Aguardando produtores..."
+                    )
+                    self._warned_no_topic = True
+                return False
+
+            tps = []
+            for pid in sorted(topic_meta.partitions.keys()):
+                try:
+                    low, high = self.consumer.get_watermark_offsets(
+                        TopicPartition(self.topic_name, pid), timeout=1.5
+                    )
+                    start_off = max(low, high - 16) if high > low else OFFSET_END
+                except Exception:
+                    start_off = OFFSET_END
+                tps.append(TopicPartition(self.topic_name, pid, start_off))
+
+            self.consumer.assign(tps)
+            self._assigned = True
+            print(
+                f"[Kafka] Conectado a '{self.bootstrap_servers}' | Tópico '{self.topic_name}' "
+                f"({len(tps)} partição/ões) atribuído com sucesso."
+            )
+            return True
+        except Exception as e:
+            print(f"[Kafka] Falha ao conectar ao broker '{self.bootstrap_servers}': {e}")
+            return False
 
     def start(self):
         self.running = True
@@ -53,10 +109,14 @@ class TurboKafkaReader:
     def _update_loop(self):
         """Loop de alta velocidade em C."""
         while self.running:
+            if not self._ensure_assigned():
+                time.sleep(0.02)
+                continue
+
             # 1. DRENAGEM DE FILA (Consume Batch)
             # Em vez de poll(), usamos consume() para pegar até 50 mensagens de uma vez
             # Isso limpa o buffer interno do driver rapidamente
-            msgs = self.consumer.consume(num_messages=50, timeout=0.01)
+            msgs = self.consumer.consume(num_messages=50, timeout=0.015)
             
             if not msgs:
                 continue
@@ -67,20 +127,22 @@ class TurboKafkaReader:
             for msg in msgs:
                 if msg.error():
                     continue
+                val = msg.value()
+                if val is None:
+                    continue
                 
                 # Leitura da Chave (Rápida)
                 key_bytes = msg.key()
-                if key_bytes:
-                    cam_id = key_bytes.decode('utf-8')
-                    
-                    # Filtro de Câmera (Economia de CPU)
-                    # Se definimos que queremos ver só a 'cam3', ignoramos o resto aqui.
-                    if self.target_camera_id and cam_id != self.target_camera_id:
-                        continue
+                cam_id = key_bytes.decode('utf-8', errors='replace') if key_bytes else (self.target_camera_id or 'cam1')
+                
+                # Filtro de Câmera (Economia de CPU)
+                # Se definimos que queremos ver só a 'cam3', ignoramos o resto aqui.
+                if self.target_camera_id and cam_id != self.target_camera_id:
+                    continue
 
-                    # Sobrescreve: Se vieram 10 frames da 'cam3', só o último fica no dict
-                    # Não decodificamos ainda! Só guardamos os bytes.
-                    batch_updates[cam_id] = msg.value()
+                # Sobrescreve: Se vieram 10 frames da 'cam3', só o último fica no dict
+                # Não decodificamos ainda! Só guardamos os bytes.
+                batch_updates[cam_id] = val
 
             # 2. DECODIFICAÇÃO (Gargalo de CPU)
             # Agora decodificamos APENAS os vencedores (1 frame por câmera)

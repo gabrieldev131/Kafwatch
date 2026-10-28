@@ -7,9 +7,9 @@ name = "kafwatch-worker"
 version = "0.1.0"
 dependencies = [
     # Coloque suas dependências aqui
-    "opencv-python",
+    "opencv-python-headless",
     "python-dotenv",
-    "kafka-python",
+    "confluent-kafka",
     "numpy"
 ]
 

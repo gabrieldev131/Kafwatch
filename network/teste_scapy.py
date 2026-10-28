@@ -19,15 +19,28 @@ REDES_PRIVADAS = (
     ipaddress.ip_network("192.168.0.0/16"),
 )
 
-# Limite seguro de conexões simultâneas (abaixo do ulimit -n padrão de 1024)
-MAX_CONCURRENT_PROBES = 512
-DEFAULT_PING_TIMEOUT = 0.15
-DEFAULT_RTSP_TIMEOUT = 0.20
+# Limite seguro de conexões simultâneas (evita overflow da tabela ARP do kernel gc_thresh1=128/gc_thresh2=512
+# e evita perda de pacotes ARP broadcast no buffer RX de câmeras IP embarcadas)
+MAX_CONCURRENT_PROBES = 64
+DEFAULT_PING_TIMEOUT = 0.25
+DEFAULT_RTSP_TIMEOUT = 0.30
+DEFAULT_PROBE_PACE_S = 0.0015
+RTSP_PORTS = (554, 8554, 10554)
 
 
 def _eh_interface_virtual(iface: str) -> bool:
     iface_lower = iface.lower()
     return iface_lower.startswith(IGNORED_INTERFACE_PREFIXES)
+
+
+def _prioridade_interface(iface: str) -> int:
+    """Prioriza interfaces cabeadas Ethernet (en*, eth*) antes de interfaces Wi-Fi (wl*)."""
+    iface_lower = iface.lower()
+    if iface_lower.startswith(("en", "eth")):
+        return 0
+    if iface_lower.startswith("wl"):
+        return 2
+    return 1
 
 
 # --- Função auxiliar para resolver ARP ---
@@ -45,7 +58,7 @@ def resolver_arp(ip, iface):
 def obter_redes():
     """
     Obtém os endereços de IP da máquina host (redes físicas/LAN às quais a máquina está conectada),
-    ignorando interfaces de loopback, Docker bridges e VPNs.
+    ignorando interfaces de loopback, Docker bridges e VPNs, e ordenando redes cabeadas primeiro.
 
     Retorna uma lista com todas as conexões válidas.
     """
@@ -71,7 +84,27 @@ def obter_redes():
                 }
                 if tabela not in redes:
                     redes.append(tabela)
+
+    redes.sort(
+        key=lambda r: (
+            _prioridade_interface(r.get("interface", "")),
+            ipaddress.IPv4Network(r["range"], strict=False).num_addresses,
+        )
+    )
     return redes
+
+
+def obter_ip_host_principal() -> str:
+    """
+    Retorna o IP LAN principal da máquina host (priorizando Ethernet cabeada),
+    útil para configurar KAFKA_ADVERTISED_LISTENERS em acesso multi-computador/servidor.
+    """
+    redes = obter_redes()
+    for rede in redes:
+        ip = rede.get("ip")
+        if ip and eh_rede_local(ip):
+            return ip
+    return "localhost"
 
 
 # - Descobrir quais dos ranges são de uma rede local (LAN) -
@@ -95,7 +128,7 @@ def ping_host(ip, porta=554, timeout=DEFAULT_PING_TIMEOUT):
 
 def filtragem(redes):
     """
-     Passo 1: Filtra apenas as redes locais (LAN) válidas,
+    Passo 1: Filtra apenas as redes locais (LAN) válidas,
     ignorando interfaces virtuais (Docker, loopback, VPN) e duplicatas.
     """
     ranges_locais = []
@@ -111,18 +144,30 @@ def filtragem(redes):
     return ranges_locais
 
 
-def expande_range_lista_IP(ranges_locais):
+def expande_range_lista_IP(ranges_locais, ips_ignorar=None):
     """
-    Expande cada range em uma lista de IPs individuais (em formato string).
+    Expande cada range em uma lista de IPs individuais (em formato string),
+    excluindo os próprios IPs da máquina host.
     """
+    ignorar = set(ips_ignorar or ())
     todos_os_ips_de_todos_os_ranges = []
     for range_da_rede in ranges_locais:
         target_network = ipaddress.IPv4Network(range_da_rede, strict=False)
-        todos_os_ips_de_todos_os_ranges.extend(str(ip) for ip in target_network.hosts())
+        todos_os_ips_de_todos_os_ranges.extend(
+            str(ip) for ip in target_network.hosts() if str(ip) not in ignorar
+        )
     return todos_os_ips_de_todos_os_ranges
 
 
-async def _async_probe_host(ip_str: str, sem: asyncio.Semaphore, porta: int = 554, timeout: float = DEFAULT_PING_TIMEOUT):
+async def _async_probe_host(
+    ip_str: str,
+    sem: asyncio.Semaphore,
+    porta: int = 554,
+    timeout: float = DEFAULT_PING_TIMEOUT,
+    delay_s: float = 0.0,
+):
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
     async with sem:
         try:
             conn = asyncio.open_connection(ip_str, porta)
@@ -134,23 +179,41 @@ async def _async_probe_host(ip_str: str, sem: asyncio.Semaphore, porta: int = 55
                 pass
             return ip_str
         except ConnectionRefusedError:
-            # Host respondeu com TCP RST, portanto está ativo na LAN
-            return ip_str
+            # Host está ativo na LAN, mas a porta principal (554) recusou conexão.
+            # Verifica rapidamente se alguma porta RTSP alternativa (8554, 10554) está aberta.
+            for alt_port in RTSP_PORTS:
+                if alt_port == porta:
+                    continue
+                try:
+                    conn = asyncio.open_connection(ip_str, alt_port)
+                    reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    return ip_str
+                except Exception:
+                    continue
+            return None
         except Exception:
             return None
 
 
-async def _async_ping_hosts(ips_list, porta=554, timeout=DEFAULT_PING_TIMEOUT):
+async def _async_ping_hosts(ips_list, porta=554, timeout=DEFAULT_PING_TIMEOUT, pace_s=DEFAULT_PROBE_PACE_S):
     sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
-    tasks = [_async_probe_host(str(ip), sem, porta=porta, timeout=timeout) for ip in ips_list]
+    tasks = [
+        _async_probe_host(str(ip), sem, porta=porta, timeout=timeout, delay_s=idx * pace_s)
+        for idx, ip in enumerate(ips_list)
+    ]
     results = await asyncio.gather(*tasks)
     return [ip for ip in results if ip is not None]
 
 
 def criar_pool_threads(todos_os_ips_de_todos_os_ranges):
     """
-    Executa a descoberta de hosts ativos em alta concorrência usando I/O assíncrono
-    (capaz de sondar centenas de IPs simultaneamente com baixo custo de CPU).
+    Executa a descoberta de hosts ativos em alta concorrência com micro-pacing assíncrono
+    para não saturar a tabela ARP do kernel Linux nem o buffer de rede das câmeras IP.
     """
     if not todos_os_ips_de_todos_os_ranges:
         return []
@@ -158,9 +221,27 @@ def criar_pool_threads(todos_os_ips_de_todos_os_ranges):
 
 
 def ping_em_paralelo(redes):
+    own_ips = {rede.get("ip") for rede in redes if rede.get("ip")}
     ranges_locais = filtragem(redes)
-    ips_nos_ranges = expande_range_lista_IP(ranges_locais)
-    icmp_hosts = criar_pool_threads(ips_nos_ranges)
+    icmp_hosts = []
+
+    # Escaneia sub-rede por sub-rede (iniciando pela Ethernet cabeada)
+    for idx, range_da_rede in enumerate(ranges_locais):
+        ips_subrede = expande_range_lista_IP([range_da_rede], ips_ignorar=own_ips)
+        if not ips_subrede:
+            continue
+        # Sub-redes cabeadas usam pace seguro de 1.5ms; sub-redes Wi-Fi enormes (>1024 IPs)
+        # usam pace mais curto caso já tenhamos escaneado a rede principal
+        pace_s = DEFAULT_PROBE_PACE_S if len(ips_subrede) <= 1024 else 0.0006
+        encontrados = asyncio.run(_async_ping_hosts(ips_subrede, pace_s=pace_s))
+        icmp_hosts.extend(encontrados)
+        # Se a sub-rede prioritária (Ethernet cabeada) já encontrou hosts RTSP, não precisamos
+        # varrer milhares de IPs de redes secundárias Wi-Fi (/20) desnecessariamente
+        if idx == 0 and encontrados and len(ranges_locais) > 1:
+            next_net = ipaddress.IPv4Network(ranges_locais[1], strict=False)
+            if next_net.num_addresses > 1024:
+                break
+
     return icmp_hosts
 
 

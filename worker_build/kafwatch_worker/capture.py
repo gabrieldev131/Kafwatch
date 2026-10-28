@@ -4,16 +4,16 @@ import sys
 import threading
 import time
 
-# Força transporte RTSP via TCP e desativa buffers do FFmpeg para menor latência e maior estabilidade no Docker
+# Força transporte RTSP via TCP, desativa buffers do FFmpeg e define timeout de socket (3s)
+# para menor latência e reconexão imediata no Docker/Kubernetes
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;3000000",
 )
 
 import cv2
+from confluent_kafka import Producer
 from dotenv import load_dotenv
-from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
 
 
 # --- Classe para Leitura de Câmera em Thread Separada ---
@@ -55,6 +55,7 @@ class CameraBufferCleaner:
                     print(f"[Worker] Aguardando stream RTSP ficar disponível: {self.rtsp_url}", flush=True)
                     time.sleep(self.reconnect_delay)
                     continue
+                print(f"[Worker] Conectado ao stream RTSP: {self.rtsp_url}", flush=True)
 
             ret, frame = self.stream.read()
             if not ret or frame is None:
@@ -91,28 +92,20 @@ class CameraBufferCleaner:
                 pass
 
 
-def create_kafka_producer(bootstrap_servers: str, retry_delay: float = 2.0) -> KafkaProducer:
-    """Conecta ao Kafka com tentativas automáticas até o broker estar pronto."""
-    while True:
-        try:
-            # Nota: não usamos compression_type='gzip' pois imagens JPEG já são comprimidas;
-            # comprimir JPEG com gzip consome muita CPU sem reduzir tamanho.
-            return KafkaProducer(
-                bootstrap_servers=bootstrap_servers,
-                acks=1,
-                linger_ms=5,
-                batch_size=65536,
-                buffer_memory=16777216,
-                max_in_flight_requests_per_connection=5,
-                request_timeout_ms=10000,
-                max_block_ms=5000,
-            )
-        except NoBrokersAvailable:
-            print(f"[Worker] Aguardando broker Kafka em {bootstrap_servers}...", flush=True)
-            time.sleep(retry_delay)
-        except Exception as e:
-            print(f"[Worker] Erro ao conectar ao Kafka ({e}), tentando novamente...", flush=True)
-            time.sleep(retry_delay)
+def create_kafka_producer(bootstrap_servers: str) -> Producer:
+    """Cria o produtor Confluent Kafka (librdkafka em C) otimizado para streaming de vídeo."""
+    producer_conf = {
+        "bootstrap.servers": bootstrap_servers,
+        "linger.ms": 2,
+        "batch.num.messages": 16,
+        "queue.buffering.max.kbytes": 32768,
+        "message.max.bytes": 5242880,
+        "acks": 1,
+        "socket.keepalive.enable": True,
+        "reconnect.backoff.ms": 250,
+        "reconnect.backoff.max.ms": 2000,
+    }
+    return Producer(producer_conf)
 
 
 def main():
@@ -127,8 +120,10 @@ def main():
         sys.exit(1)
 
     # Configurações de Qualidade e Taxa de Quadros
-    NOVO_TAMANHO = (640, 480)
-    QUALIDADE_JPEG = int(os.environ.get("JPEG_QUALITY", "70"))  # 70 oferece ótimo equilíbrio tamanho/qualidade
+    WIDTH = int(os.environ.get("FRAME_WIDTH", "640"))
+    HEIGHT = int(os.environ.get("FRAME_HEIGHT", "480"))
+    NOVO_TAMANHO = (WIDTH, HEIGHT)
+    QUALIDADE_JPEG = int(os.environ.get("JPEG_QUALITY", "75"))
     MAX_FPS = float(os.environ.get("MAX_FPS", "30"))
     min_frame_interval = 1.0 / MAX_FPS if MAX_FPS > 0 else 0.0
 
@@ -144,14 +139,19 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # 1. Configurar Kafka (com retry caso o broker ainda esteja iniciando)
+    # 1. Configurar Produtor Confluent Kafka (C-based)
     produtor = create_kafka_producer(KAFKA_HOST)
 
     # 2. Iniciar captura em Thread
-    print(f"[{CAMERA_ID}] Iniciando captura otimizada de {RTSP_URL}...", flush=True)
+    print(
+        f"[{CAMERA_ID}] Iniciando captura otimizada de {RTSP_URL} -> Kafka ({KAFKA_HOST}, tópico='{TOPIC_NAME}')...",
+        flush=True,
+    )
     cam_cleaner = CameraBufferCleaner(RTSP_URL)
 
     last_sent_time = 0.0
+    sent_count = 0
+    t_log = time.monotonic()
 
     try:
         while running:
@@ -159,6 +159,7 @@ def main():
             sucess, frame = cam_cleaner.read(timeout=0.5)
 
             if not sucess or frame is None:
+                produtor.poll(0)
                 continue
 
             now = time.monotonic()
@@ -175,12 +176,23 @@ def main():
             ret, buffer = cv2.imencode(".jpg", frame_redimensionado, encode_params)
 
             if ret:
-                produtor.send(
-                    TOPIC_NAME,
-                    key=camera_key,
-                    value=buffer.tobytes(),
-                )
-                last_sent_time = now
+                try:
+                    produtor.produce(
+                        TOPIC_NAME,
+                        key=camera_key,
+                        value=buffer.tobytes(),
+                    )
+                    produtor.poll(0)
+                    last_sent_time = now
+                    sent_count += 1
+                except BufferError:
+                    produtor.poll(0.05)
+
+            if (now - t_log) >= 5.0:
+                actual_fps = sent_count / (now - t_log)
+                print(f"[{CAMERA_ID}] Publicando no Kafka a {actual_fps:.1f} FPS", flush=True)
+                sent_count = 0
+                t_log = now
 
     except KeyboardInterrupt:
         print("Parando...", flush=True)
@@ -188,7 +200,6 @@ def main():
         cam_cleaner.stop()
         try:
             produtor.flush(timeout=2.0)
-            produtor.close(timeout=2.0)
         except Exception:
             pass
 

@@ -1,20 +1,22 @@
 import os
+import signal
 import sys
 import threading
 import time
+from urllib.parse import quote
 
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;3000000"
 )
 
 import cv2
+from confluent_kafka import Producer
 from dotenv import load_dotenv
-from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
+
 
 # --- Classe para Leitura de Câmera em Thread Separada ---
-# Isso impede que o 'send' do Kafka bloqueie a leitura da câmera
+# Isso impede que o envio ao Kafka bloqueie a leitura da câmera
 class CameraBufferCleaner:
     def __init__(self, rtsp_url, reconnect_delay=2.0):
         self.rtsp_url = rtsp_url
@@ -82,90 +84,138 @@ class CameraBufferCleaner:
             except Exception:
                 pass
 
+
+def stream_camera_worker(
+    cam_id: str,
+    rtsp_url: str,
+    produtor: Producer,
+    topic: str,
+    novo_tamanho: tuple[int, int],
+    qualidade_jpeg: int,
+    max_fps: float,
+    stop_event: threading.Event,
+):
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), qualidade_jpeg]
+    camera_key = cam_id.encode("utf-8")
+    min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
+
+    print(f"[{cam_id}] Conectando a {rtsp_url} -> tópico '{topic}'...", flush=True)
+    cam_cleaner = CameraBufferCleaner(rtsp_url)
+
+    contador_frames = 0
+    contador_bytes = 0
+    tempo_inicio = time.monotonic()
+    last_sent = 0.0
+
+    try:
+        while not stop_event.is_set():
+            sucess, frame = cam_cleaner.read(timeout=0.5)
+            if not sucess or frame is None:
+                produtor.poll(0)
+                continue
+
+            agora = time.monotonic()
+            if min_interval > 0 and (agora - last_sent) < min_interval:
+                continue
+
+            if frame.shape[1] != novo_tamanho[0] or frame.shape[0] != novo_tamanho[1]:
+                frame_redimensionado = cv2.resize(frame, novo_tamanho, interpolation=cv2.INTER_LINEAR)
+            else:
+                frame_redimensionado = frame
+
+            ret, buffer = cv2.imencode(".jpg", frame_redimensionado, encode_params)
+            if ret:
+                dados_msg = buffer.tobytes()
+                try:
+                    produtor.produce(topic, key=camera_key, value=dados_msg)
+                    produtor.poll(0)
+                    last_sent = agora
+                    contador_frames += 1
+                    contador_bytes += len(dados_msg)
+                except BufferError:
+                    produtor.poll(0.05)
+
+            tempo_passado = agora - tempo_inicio
+            if tempo_passado >= 5.0:
+                fps = contador_frames / tempo_passado
+                mb_s = (contador_bytes / (1024 * 1024)) / tempo_passado
+                print(f"[{cam_id}] FPS: {fps:.1f} | Rede: {mb_s:.2f} MiB/s", flush=True)
+                contador_frames = 0
+                contador_bytes = 0
+                tempo_inicio = agora
+    finally:
+        cam_cleaner.stop()
+
+
 def main():
     load_dotenv()
     RTSP_URL = os.environ.get("RTSP_URL")
     CAMERA_ID = os.environ.get("CAMERA_ID", "cam1")
-    KAFKA_HOST = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+    KAFKA_HOST = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    TOPIC_NAME = os.environ.get("KAFKA_TOPIC", "meu-topico-de-video")
+    USERNAME = os.environ.get("RTSP_USERNAME", "admin")
+    PASSWORD = quote(os.environ.get("RTSP_PASSWORD", "Aluno@00"))
 
-    # Configurações de Qualidade
     NOVO_TAMANHO = (640, 480)
-    QUALIDADE_JPEG = int(os.environ.get("JPEG_QUALITY", "70")) # 70 é um ótimo balanço entre tamanho e velocidade
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), QUALIDADE_JPEG]
-    camera_key = CAMERA_ID.encode('utf-8')
-    
-    # 1. Configurar Kafka
-    while True:
-        try:
-            produtor = KafkaProducer(
-                bootstrap_servers=KAFKA_HOST,
-                acks=1,
-                linger_ms=5, 
-                batch_size=65536,
-                buffer_memory=16777216,
-                max_in_flight_requests_per_connection=5,
-            )
-            break
-        except NoBrokersAvailable:
-            print(f"Aguardando Kafka em {KAFKA_HOST}...")
-            time.sleep(2.0)
-    
-    # 2. Iniciar captura em Thread
-    cam_cleaner = CameraBufferCleaner(RTSP_URL)
+    QUALIDADE_JPEG = int(os.environ.get("JPEG_QUALITY", "75"))
+    MAX_FPS = float(os.environ.get("MAX_FPS", "30"))
 
-    contador_frames = 0
-    contador_bytes = 0
-    tempo_inicio = time.time()
-    
+    # Se RTSP_URL não estiver definida, descobre automaticamente as câmeras na rede local
+    sources = {}
+    if RTSP_URL:
+        sources[CAMERA_ID] = RTSP_URL
+    else:
+        from network.teste_scapy import discover
+        print("RTSP_URL não definida; descobrindo câmeras RTSP na rede...")
+        cameras = discover()
+        for idx, ip in enumerate(cameras, start=1):
+            sources[f"cam{idx}"] = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554"
+
+    if not sources:
+        print("Nenhuma câmera encontrada ou configurada em RTSP_URL.")
+        sys.exit(1)
+
+    producer_conf = {
+        "bootstrap.servers": KAFKA_HOST,
+        "linger.ms": 2,
+        "batch.num.messages": 16,
+        "queue.buffering.max.kbytes": 32768,
+        "message.max.bytes": 5242880,
+        "acks": 1,
+        "socket.keepalive.enable": True,
+    }
+    produtor = Producer(producer_conf)
+
+    stop_event = threading.Event()
+
+    def _sig_handler(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    threads = []
+    for cid, url in sources.items():
+        t = threading.Thread(
+            target=stream_camera_worker,
+            args=(cid, url, produtor, TOPIC_NAME, NOVO_TAMANHO, QUALIDADE_JPEG, MAX_FPS, stop_event),
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+
+    print(f"Produtor Kafka iniciado em {KAFKA_HOST} para câmeras: {list(sources.keys())}")
     try:
-        while True:
-            # Aguarda um NOVO frame da câmera sem desperdiçar CPU reenviando duplicatas
-            sucess, frame = cam_cleaner.read(timeout=0.5)
-            
-            if not sucess or frame is None:
-                continue
-            
-            # --- Processamento ---
-            if frame.shape[1] != NOVO_TAMANHO[0] or frame.shape[0] != NOVO_TAMANHO[1]:
-                frame_redimensionado = cv2.resize(frame, NOVO_TAMANHO, interpolation=cv2.INTER_LINEAR)
-            else:
-                frame_redimensionado = frame
-            
-            # --- Compressão (Essencial para FPS alto) ---
-            ret, buffer = cv2.imencode('.jpg', frame_redimensionado, encode_params)
-            
-            if ret:
-                dados_msg = buffer.tobytes()
-                
-                # Envio Assíncrono (Fire and Forget)
-                produtor.send(
-                    'meu-topico-de-video', 
-                    key=camera_key, 
-                    value=dados_msg
-                )
-                
-                # Stats
-                contador_frames += 1
-                contador_bytes += len(dados_msg)
-            
-            # --- Monitoramento (A cada 1s) ---
-            tempo_atual = time.time()
-            tempo_passado = tempo_atual - tempo_inicio
-            if tempo_passado >= 1.0:
-                fps = contador_frames / tempo_passado
-                mb_s = (contador_bytes / (1024*1024)) / tempo_passado
-                
-                #print(f"[{CAMERA_ID}] FPS: {fps:.2f} | Rede: {mb_s:.2f} MiB/s")
-                
-                contador_frames = 0
-                contador_bytes = 0
-                tempo_inicio = time.time()
-
+        while not stop_event.is_set():
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print("Parando...")
     finally:
-        cam_cleaner.stop()
-        produtor.close()
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=2.0)
+        produtor.flush(timeout=2.0)
+
 
 if __name__ == "__main__":
     main()

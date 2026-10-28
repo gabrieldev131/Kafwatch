@@ -3,7 +3,8 @@ import yaml
 import os
 from pathlib import Path
 from urllib.parse import quote
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
+from network.teste_scapy import obter_ip_host_principal
 
 class ComposeGenerator:
     
@@ -12,11 +13,22 @@ class ComposeGenerator:
     do Docker Compose e MediaMTX em memória.
     """
     
-    # MODIFICAÇÃO: Aceita 'default_port' para saber qual porta usar
-    def __init__(self, username: str, password: str, default_port: int = 554):
+    # MODIFICAÇÃO: Aceita 'default_port' e 'kafka_external_host' (para rodar em servidor/outro PC)
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        default_port: int = 554,
+        kafka_external_host: Optional[str] = None,
+    ):
         self.username = username
         self.password_encoded = quote(password)
         self.default_port = default_port
+        self.kafka_external_host = (
+            kafka_external_host
+            or os.environ.get("KAFKA_EXTERNAL_HOST")
+            or obter_ip_host_principal()
+        )
         
         self._default_logging = {
             'driver': 'json-file',
@@ -44,7 +56,7 @@ class ComposeGenerator:
                     'container_name': 'kafka',
                     'networks': ['camera-net'],
                     'restart': 'unless-stopped',
-                    'ports': ["9092:9092"],
+                    'ports': ["9092:9092", "9094:9094"],
                     # O diretório de logs do Kafka vive inteiramente em RAM (tmpfs).
                     # Nada é persistido no SSD; evita desgaste de disco e garante alta velocidade.
                     'tmpfs': ['/var/lib/kafka/data:uid=1000,gid=1000,mode=1770,size=1g'],
@@ -52,14 +64,20 @@ class ComposeGenerator:
                         'KAFKA_PROCESS_ROLES': 'broker,controller',
                         'KAFKA_NODE_ID': 1,
                         'KAFKA_CONTROLLER_QUORUM_VOTERS': '1@kafka:9093',
-                        'KAFKA_LISTENERS': 'INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093',
-                        'KAFKA_LISTENER_SECURITY_PROTOCOL_MAP': 'INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT',
-                        'KAFKA_ADVERTISED_LISTENERS': 'INTERNAL://kafka:29092,EXTERNAL://localhost:9092',
+                        'KAFKA_LISTENERS': 'INTERNAL://:29092,EXTERNAL://:9092,LOCAL://:9094,CONTROLLER://:9093',
+                        'KAFKA_LISTENER_SECURITY_PROTOCOL_MAP': 'INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,LOCAL:PLAINTEXT,CONTROLLER:PLAINTEXT',
+                        'KAFKA_ADVERTISED_LISTENERS': (
+                            f'INTERNAL://kafka:29092,'
+                            f'EXTERNAL://{self.kafka_external_host}:9092,'
+                            f'LOCAL://localhost:9094'
+                        ),
                         'KAFKA_CONTROLLER_LISTENER_NAMES': 'CONTROLLER',
                         'KAFKA_INTER_BROKER_LISTENER_NAME': 'INTERNAL',
                         'KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR': 1,
                         'KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR': 1,
                         'KAFKA_TRANSACTION_STATE_LOG_MIN_ISR': 1,
+                        'KAFKA_AUTO_CREATE_TOPICS_ENABLE': 'true',
+                        'KAFKA_NUM_PARTITIONS': 1,
                         'CLUSTER_ID': 'MkU3OEVBNTcwNTJENDM2Qk',
 
                         # Limita o heap da JVM para evitar consumo excessivo de RAM ou OOM
@@ -181,8 +199,11 @@ class ComposeGenerator:
 
     def print_report(self, mediamtx_config: Dict):
         """(S)RP: Responsabilidade separada para apenas imprimir o relatório."""
-        print("\n--- Relatório de Streams ---")
+        print("\n--- Relatório de Streams & Kafka ---")
+        print(f"  [Kafka Local]   localhost:9092 (ou localhost:9094)")
+        print(f"  [Kafka Rede/PC] {self.kafka_external_host}:9092 (para acesso de outro computador/servidor)")
+        print(f"  [Kafka Docker]  kafka:29092 (acesso interno dos workers)")
         for path, config in mediamtx_config['paths'].items():
             print(f"  [Câmera Real] {config['source']}")
             print(f"    -> [Proxy] rtsp://rtsp-proxy:8554/{path} (acesso interno dos workers)")
-            print(f"    -> [Host]  rtsp://localhost:8554/{path} (acesso do seu PC, ex: VLC)")
+            print(f"    -> [Host]  rtsp://{self.kafka_external_host}:8554/{path} (acesso externo, ex: VLC)")

@@ -1,1 +1,7 @@
-paths: {}
+paths:
+  cam1:
+    source: rtsp://admin:Aluno%4000@10.145.80.51:554
+    rtspTransport: tcp
+  cam2:
+    source: rtsp://admin:Aluno%4000@10.145.80.52:554
+    rtspTransport: tcp
