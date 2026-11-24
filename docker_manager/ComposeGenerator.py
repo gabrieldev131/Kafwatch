@@ -116,10 +116,10 @@ class ComposeGenerator:
                     },
                     'logging': copy.deepcopy(self._default_logging)
                 },
-                'kafka-ui':
+                'kafka-ui': {
                     'image': 'ghcr.io/kafbat/kafka-ui:latest',
                     'container_name': 'kafka-ui',
-                    'ports': ["8080:8080"],
+                    'ports': ["8081:8080"],
                     'networks': ['camera-net'],
                     'depends_on': {
                     'rtsp-proxy': {'condition': 'service_started'},
@@ -132,6 +132,7 @@ class ComposeGenerator:
                     },
                     
                     'logging': copy.deepcopy(self._default_logging)
+                }
             },
             'networks': {
                 'camera-net': {'driver': 'bridge'}

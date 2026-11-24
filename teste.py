@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     USERNAME = os.environ.get("RTSP_USERNAME", "admin")
     PASSWORD = os.environ.get("RTSP_PASSWORD", "Aluno@00")
-    KAFKA_EXTERNAL_HOST = os.environ.get("KAFKA_EXTERNAL_HOST")
+    KAFKA_EXTERNAL_HOST = os.environ.get("KAFKA_EXTERNAL_HOST", "10.145.80.60")
 
     # --- 1. Carregar Templates Estáticos ---
     # (S)RP: A classe FileSystemWriter também pode carregar templates
