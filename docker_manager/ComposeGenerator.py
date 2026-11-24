@@ -115,7 +115,23 @@ class ComposeGenerator:
                         'start_period': '15s'
                     },
                     'logging': copy.deepcopy(self._default_logging)
-                }
+                },
+                'kafka-ui':
+                    'image': 'ghcr.io/kafbat/kafka-ui:latest',
+                    'container_name': 'kafka-ui',
+                    'ports': ["8080:8080"],
+                    'networks': ['camera-net'],
+                    'depends_on': {
+                    'rtsp-proxy': {'condition': 'service_started'},
+                    'kafka': {'condition': 'service_healthy'}
+                    },
+                    'environment': {
+                        'KAFKA_CLUSTERS_0_NAME': 'local',
+                        'KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS': 'kafka:29092',
+                        'DYNAMIC_CONFIG_ENABLED': 'true'
+                    },
+                    
+                    'logging': copy.deepcopy(self._default_logging)
             },
             'networks': {
                 'camera-net': {'driver': 'bridge'}
